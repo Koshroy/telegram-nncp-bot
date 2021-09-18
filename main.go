@@ -1,11 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-telegram-bot-api/telegram-bot-api"
@@ -13,6 +19,7 @@ import (
 )
 
 type MsgStatus int
+
 const (
 	MsgUnsent = iota
 	MsgFailed
@@ -21,24 +28,38 @@ const (
 
 type Message struct {
 	Timestamp string
-	ChatId int64
-	Username string
-	Contents string
+	ChatId    int64
+	Username  string
+	Contents  string
+	Status    MsgStatus
+}
+
+type MsgDbUpdate struct {
+	Rowid  int
+	Status MsgStatus
 }
 
 func tgToSqlMsg(ts int, username string, chatId int64, contents string) Message {
 	isoTs := time.Unix(int64(ts), 0).Format(time.RFC3339)
 	return Message{
 		Timestamp: isoTs,
-		ChatId: chatId,
-		Username: username,
-		Contents: contents,
+		ChatId:    chatId,
+		Username:  username,
+		Contents:  contents,
+		Status:    MsgUnsent,
 	}
 }
 
 func main() {
 	initFlag := flag.Bool("init", false, "initialize the database")
+	dryRun := flag.Bool("dryrun", false, "do not actually run nncp")
+	debug := flag.Bool("debug", false, "enable debug logging")
+	botDebug := flag.Bool("botdebug", false, "enable debug logging for the telegram bot")
 	flag.Parse()
+
+	if *dryRun {
+		log.Println("Running in dry run mode, so not invoking nncp")
+	}
 
 	db, err := sql.Open("sqlite3", "./messages.db")
 	if err != nil {
@@ -48,7 +69,7 @@ func main() {
 	if *initFlag {
 		log.Printf("Initializing database")
 		sqlStmt := `
-                CREATE TABLE messages (timestamp TEXT, chat_id INTEGER, username TEXT, contents TEXT);
+                CREATE TABLE messages (timestamp TEXT, chat_id INTEGER, username TEXT, contents TEXT, status INTEGER);
                 DELETE FROM messages;
                 `
 		_, err := db.Exec(sqlStmt)
@@ -63,12 +84,55 @@ func main() {
 	if apiKey == "" {
 		log.Fatalln("Need to set the Telegram bot secret in envar TG_BOT_SECRET, got empty string")
 	}
+	nncpPath := os.Getenv("NNCP_PATH")
+	if nncpPath == "" {
+		nncpPath = "nncp-file"
+	} else {
+		absPath, err := filepath.Abs(nncpPath)
+		if err == nil {
+			nncpPath = absPath
+		} else {
+			if *debug {
+				log.Printf("error canonicalizing nncp-file path: %v\n", err)
+			}
+		}
+
+	}
+	nncpCfgPath := os.Getenv("NNCP_CFG_PATH")
+	if nncpCfgPath != "" {
+		absPath, err := filepath.Abs(nncpCfgPath)
+		if err == nil {
+			nncpCfgPath = absPath
+		} else {
+			if *debug {
+				log.Printf("error canonicalizing config path: %v\n", err)
+			}
+		}
+	}
+	destNode := flag.Arg(0)
+	if destNode == "" && !*dryRun {
+		log.Fatalln("Need a destination node to send messages to")
+	}
+
+	if !*dryRun {
+		go nncpLoop(nncpPath, nncpCfgPath, db, destNode, *debug)
+	}
+
+	if *debug {
+		log.Println("Running with debug output")
+		log.Println("nncp path:", nncpPath)
+		log.Println("config path:", nncpCfgPath)
+		log.Println("destination node:", destNode)
+	}
+
 	bot, err := tgbotapi.NewBotAPI(apiKey)
 	if err != nil {
 		log.Fatalf("error connecting to bot api: %v\n", err)
 	}
 
-	bot.Debug = true
+	if *botDebug {
+		bot.Debug = true
+	}
 
 	log.Printf("Authorized on account %s", bot.Self.UserName)
 
@@ -92,7 +156,7 @@ func main() {
 		} else {
 			ts = update.Message.Date
 		}
-		
+
 		dbMsg := tgToSqlMsg(ts, update.Message.From.UserName, update.Message.Chat.ID, update.Message.Text)
 		log.Printf("[%s] %s", update.Message.From.UserName, update.Message.Text)
 		err := addMsg(db, &dbMsg)
@@ -112,8 +176,132 @@ func addMsg(db *sql.DB, msg *Message) error {
 		return errors.New("message timestamp, chat id, username, and contents must be provided")
 	}
 
-	insertStmt := "INSERT INTO messages(timestamp, chat_id, username, contents) VALUES(?, ?, ?, ?)"
+	insertStmt := "INSERT INTO messages(timestamp, chat_id, username, contents, status) VALUES(?, ?, ?, ?, ?)"
 
-	_, err := db.Exec(insertStmt, msg.Timestamp, msg.ChatId, msg.Username, msg.Contents)
+	_, err := db.Exec(insertStmt, msg.Timestamp, msg.ChatId, msg.Username, msg.Contents, msg.Status)
 	return err
+}
+
+func changeMsgStatus(db *sql.DB, rowid int, status MsgStatus) error {
+	stmt, err := db.Prepare("UPDATE messages SET status = ? WHERE rowid = ?")
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	_, err = stmt.Exec(status, rowid)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func nncpLoop(nncpPath string, nncpCfgPath string, db *sql.DB, destNode string, debug bool) {
+	for {
+		var payloadBuf bytes.Buffer
+		var destBuf strings.Builder
+
+		var stdoutBuf bytes.Buffer
+
+		<-time.After(2 * time.Second)
+
+		// We need to release resources on every loop iteration
+		// So wrap this block in a function and execute the function
+		// on each loop iteration. The "defer" calls will release resources
+		// on function return
+		func() {
+			stmt, err := db.Prepare(
+				"SELECT rowid, timestamp, chat_id, username, contents FROM messages WHERE status = ?",
+			)
+			if err != nil {
+				log.Printf("could not prepare SQL to query message db: %v\n", err)
+				return
+			}
+			defer stmt.Close()
+			rows, err := stmt.Query(MsgUnsent)
+			if err != nil {
+				log.Printf("error querying for unsent messages: %v\n", err)
+				return
+			}
+
+			updates := make([]MsgDbUpdate, 0)
+
+			for rows.Next() {
+				// We should never return from this function
+				// as rows.Close() must be called after this loop
+				var rowid int
+				var ts string
+				var chatId int
+				var username string
+				var contents string
+
+				err = rows.Scan(&rowid, &ts, &chatId, &username, &contents)
+				if err != nil {
+					// If we cannot unmarshal the SQLite row, log the error
+					// and move onto the next row
+					log.Printf("error hydrating sqlite db row: %v\n", err)
+					continue
+				}
+
+				log.Printf("Relaying message ID %d\n", rowid)
+				fmt.Fprintf(&payloadBuf, "[%s] <%s> %s\n", ts, username, contents)
+
+				// destNode: tgchat-%d-%s.txt (chatid, ts)
+				destBuf.WriteString(destNode)
+				destBuf.WriteRune(':')
+				destBuf.WriteString("tgchat/")
+				destBuf.WriteString(strconv.Itoa(chatId))
+				destBuf.WriteRune('/')
+				destBuf.WriteString(ts)
+				destBuf.WriteString(".txt")
+
+				if debug {
+					log.Println("destBuf:", destBuf.String())
+				}
+
+				var cmd *exec.Cmd
+				if nncpCfgPath == "" {
+					cmd = exec.Command(nncpPath, "-", destBuf.String())
+				} else {
+					cmd = exec.Command(nncpPath, "-cfg", nncpCfgPath, "-", destBuf.String())
+				}
+
+				cmd.Stdin = &payloadBuf
+				if debug {
+					cmd.Stdout = &stdoutBuf
+				}
+
+				var newStatus MsgStatus
+				err := cmd.Run()
+				if err != nil {
+					log.Printf("error occurred when running nncp-file: %v\n", err)
+					if debug {
+						log.Println("stdout: ", stdoutBuf.String())
+					}
+					newStatus = MsgFailed
+				} else {
+					newStatus = MsgSent
+				}
+				updates = append(updates, MsgDbUpdate{rowid, newStatus})
+
+				payloadBuf.Reset()
+				destBuf.Reset()
+				if debug {
+					stdoutBuf.Reset()
+				}
+			}
+			rows.Close()
+
+			for _, update := range updates {
+				if debug {
+					log.Printf("Updating rowid %d status: %d\n", update.Rowid, update.Status)
+				}
+				err := changeMsgStatus(db, update.Rowid, update.Status)
+				if err != nil {
+					log.Printf("Error updating rowid %d status: %v\n", update.Rowid, err)
+				}
+			}
+		}()
+	}
 }
