@@ -55,13 +55,18 @@ func main() {
 	dryRun := flag.Bool("dryrun", false, "do not actually run nncp")
 	debug := flag.Bool("debug", false, "enable debug logging")
 	botDebug := flag.Bool("botdebug", false, "enable debug logging for the telegram bot")
+	dbPath := flag.String("db", "./messages.db", "path to messages database")
 	flag.Parse()
 
 	if *dryRun {
 		log.Println("Running in dry run mode, so not invoking nncp")
 	}
 
-	db, err := sql.Open("sqlite3", "./messages.db")
+	if *dbPath == "" {
+		log.Fatalln("path to db was not provided")
+	}
+
+	db, err := sql.Open("sqlite3", *dbPath)
 	if err != nil {
 		log.Fatalf("could not open sqlite db: %v\n", err)
 	}
@@ -136,6 +141,8 @@ func main() {
 
 	log.Printf("Authorized on account %s", bot.Self.UserName)
 
+	welcomeSet := make(map[int64]bool)
+
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 
@@ -146,8 +153,16 @@ func main() {
 
 	for update := range updates {
 		if update.Message == nil { // ignore any non-Message Updates
-			//log.Printf("Raw message: %v\n", update)
 			continue
+		}
+
+		if _, ok := welcomeSet[update.Message.Chat.ID]; !ok {
+			if *debug {
+				log.Println("encountered previously unseen chat id:", update.Message.Chat.ID)
+			}
+			msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Hi! I'm an NNCP relay bot!")
+			bot.Send(msg)
+			welcomeSet[update.Message.Chat.ID] = true
 		}
 
 		var ts int
@@ -156,18 +171,19 @@ func main() {
 		} else {
 			ts = update.Message.Date
 		}
+		userName := update.Message.From.UserName
+		if userName == "" {
+			userName = update.Message.From.FirstName + update.Message.From.LastName
+		}
+		chatID := update.Message.Chat.ID
+		text := update.Message.Text
 
-		dbMsg := tgToSqlMsg(ts, update.Message.From.UserName, update.Message.Chat.ID, update.Message.Text)
-		log.Printf("[%s] %s", update.Message.From.UserName, update.Message.Text)
+		dbMsg := tgToSqlMsg(ts, userName, chatID, text)
+		log.Printf("#%d - [%s] %s", chatID, userName, text)
 		err := addMsg(db, &dbMsg)
 		if err != nil {
 			log.Printf("Error inserting message to database: %v\n", err)
 		}
-
-		msg := tgbotapi.NewMessage(update.Message.Chat.ID, update.Message.Text)
-		msg.ReplyToMessageID = update.Message.MessageID
-
-		bot.Send(msg)
 	}
 }
 
