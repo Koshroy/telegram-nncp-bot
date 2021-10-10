@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/go-telegram-bot-api/telegram-bot-api"
+	"github.com/google/uuid"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -267,14 +268,26 @@ func nncpLoop(nncpPath string, nncpCfgPath string, db *sql.DB, destNode string, 
 				if chatId < 0 {
 					chatId = -chatId
 				}
+				chatUuid, err := uuid.NewRandom()
 
-				// destNode: tgchat-%d-%s.txt (chatid, ts)
+				// destNode: tgchat/%d/%s-%s.txt (chatid, ts, uuid)
 				destBuf.WriteString(destNode)
 				destBuf.WriteRune(':')
 				destBuf.WriteString("tgchat/")
 				destBuf.WriteString(strconv.Itoa(chatId))
 				destBuf.WriteRune('/')
 				destBuf.WriteString(ts)
+				if err == nil {
+					uuidBytes, err := chatUuid.MarshalText()
+					if err == nil {
+						destBuf.WriteRune('-')
+						destBuf.Write(uuidBytes)
+					} else {
+						log.Printf("error marshalling uuid bytes: %v\n", err)
+					}
+				} else {
+					log.Printf("error generating uuid: %v\n", err)
+				}
 				destBuf.WriteString(".txt")
 
 				if debug {
@@ -294,7 +307,7 @@ func nncpLoop(nncpPath string, nncpCfgPath string, db *sql.DB, destNode string, 
 				}
 
 				var newStatus MsgStatus
-				err := cmd.Run()
+				err = cmd.Run()
 				if err != nil {
 					log.Printf("error occurred when running nncp-file: %v\n", err)
 					if debug {
