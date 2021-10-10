@@ -263,6 +263,11 @@ func nncpLoop(nncpPath string, nncpCfgPath string, db *sql.DB, destNode string, 
 				log.Printf("Relaying message ID %d\n", rowid)
 				fmt.Fprintf(&payloadBuf, "[%s] <%s> %s\n", ts, username, contents)
 
+				// Use positive values only for constructing filepaths
+				if chatId < 0 {
+					chatId = -chatId
+				}
+
 				// destNode: tgchat-%d-%s.txt (chatid, ts)
 				destBuf.WriteString(destNode)
 				destBuf.WriteRune(':')
