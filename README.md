@@ -19,7 +19,7 @@ Make sure to set the environment varables if needed:
 
 1. `TG_BOT_SECRET` for the Telegram Bot secret (always needed).
 2. `NNCP_PATH` for the path to `nncp-file` if it is not already in your path.
-2. `NNCP_CFG_PATH` for the path to your NNCP node config if it's not at the default path.
+3. `NNCP_CFG_PATH` for the path to your NNCP node config if it's not at the default path.
 
 Further flags are available by running `telegram-nncp-bot -h`
 
